@@ -7,8 +7,30 @@ sai pra fora. Mudança no banco não vaza pro frontend sem ajuste explícito.
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+
+# IDs no banco são UUID; o Pydantic v2 não coage UUID->str sozinho.
+# Este tipo garante que qualquer id vire string na serialização.
+StrId = Annotated[str, BeforeValidator(lambda v: str(v))]
+
+
+# ---------------------------------------------------------------------------
+# Config (não-secreta) — fonte única exibida no painel
+# ---------------------------------------------------------------------------
+class AppConfigOut(BaseModel):
+    """Configuração operacional NÃO-secreta. Nunca expõe tokens/chaves/URLs."""
+
+    luciana_phone: str
+    ai_primary: str
+    ai_fallback: str
+    business_hours_start: int
+    business_hours_end: int
+    app_env: str
+    version: str
+    # Chave VAPID pública (não é segredo) — o painel usa pra inscrever o push.
+    vapid_public_key: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -27,13 +49,16 @@ class ClienteOut(BaseModel):
 # ---------------------------------------------------------------------------
 class LeadOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    id: str
+    id: StrId
+    numero: int | None = None
     phone: str
     name: str | None = None
     destination: str | None = None
     travel_type: str | None = None
+    indicado_por: str | None = None
     lead_temp: str | None = None
     briefing_md: str | None = None
+    raw_data: dict = {}
     created_at: datetime
     updated_at: datetime
 
@@ -41,7 +66,8 @@ class LeadOut(BaseModel):
 class LeadListItem(BaseModel):
     """Versão enxuta — usada na tabela de leads, sem o briefing inteiro."""
     model_config = ConfigDict(from_attributes=True)
-    id: str
+    id: StrId
+    numero: int | None = None
     phone: str
     name: str | None = None
     destination: str | None = None
@@ -63,6 +89,34 @@ class LeadDetail(BaseModel):
     conversation_count: int = 0
 
 
+class LeadIn(BaseModel):
+    """Criação manual de lead pelo painel (numero vem da sequência)."""
+
+    phone: str = Field(min_length=5, max_length=20)
+    name: str | None = Field(default=None, max_length=120)
+    destination: str | None = Field(default=None, max_length=120)
+    travel_type: str | None = Field(default=None, max_length=120)
+    lead_temp: str | None = Field(
+        default=None, pattern=r"^(frio|morno|quente|urgente)$"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+class TagOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: StrId
+    name: str
+    color: str
+    created_at: datetime
+
+
+class TagIn(BaseModel):
+    name: str = Field(min_length=1, max_length=50)
+    color: str = Field(default="#6b7280", pattern=r"^#[0-9a-fA-F]{6}$")
+
+
 # ---------------------------------------------------------------------------
 # Conversation
 # ---------------------------------------------------------------------------
@@ -70,11 +124,14 @@ class MessageOut(BaseModel):
     # protected_namespaces=() pra permitir o campo `model_used` (que conflitaria
     # com o prefixo reservado `model_*` do Pydantic v2)
     model_config = ConfigDict(from_attributes=True, protected_namespaces=())
-    id: str
+    id: StrId
     phone: str
     role: str
     content: str
     model_used: str | None = None
+    # Link assinado temporário pro áudio do cliente (None = mensagem de texto).
+    # Gerado na rota a partir de Conversation.media_path; o painel mostra o player.
+    audio_url: str | None = None
     created_at: datetime
 
 
@@ -86,6 +143,8 @@ class ConversationSummary(BaseModel):
     last_message_preview: str
     message_count: int
     lead_temp: str | None = None
+    bot_paused: bool = False
+    tags: list[TagOut] = []
 
 
 class ConversationDetail(BaseModel):
@@ -99,7 +158,7 @@ class ConversationDetail(BaseModel):
 # ---------------------------------------------------------------------------
 class ReservaOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    id: str
+    id: StrId
     phone: str
     codigo_reserva: str | None = None
     destino: str | None = None

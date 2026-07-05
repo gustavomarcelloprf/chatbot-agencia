@@ -10,11 +10,13 @@ Fluxo (CLAUDE.md, seção "Fluxo principal de uma mensagem"):
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import hmac
 import logging
+import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
@@ -22,15 +24,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app import __version__
-from app.ai import route_and_ask
+from app.ai import extract_lead_data, route_and_ask
 from app.api import api_router
+from app.api import tick as tick_api
 from app.briefing import (
-    extract_briefing,
+    ask_missing_fields,
+    build_coleta_digest,
+    build_recap,
     extract_customer_name,
+    gate_missing_fields,
+    lead_columns_from_data,
+    merge_ficha,
+    normalize_lead_data,
     notify_luciana,
+    notify_luciana_ai_down,
+    notify_luciana_impasse,
+    notify_luciana_media,
     notify_luciana_returning_client,
+    parse_briefing_block,
     parse_lead_temp,
+    render_briefing,
     save_lead,
+    split_reply_and_briefing,
+    split_reply_and_transfer,
 )
 from app.clientes import get_or_create_cliente, update_preferred_name
 from app.commands import (
@@ -45,24 +61,42 @@ from app.commands import (
 )
 from app.config import settings
 from app.database import SessionLocal, dispose_engine
+from app.debounce import collect_burst
 from app.models import Conversation
-from app.reminders import cancel_reminders, schedule_reminders
+from app.push import send_push_to_all
+from app.reminders import cancel_reminders, schedule_callbacks
 from app.reservas import has_reserva_ativa
+from app.sanitize import price_guard, sanitize_outgoing
 from app.session import (
     STATE_AWAITING_INTENT,
     STATE_TRANSFERRED,
+    clear_coleta_state,
     clear_history,
     clear_state,
     close_redis,
+    get_coleta_state,
     get_history,
     get_redis,
     get_state,
+    save_coleta_state,
     save_history,
     set_state,
 )
+from app.audioconv import transcode_to_mp3
+from app.storage import upload_audio
+from app.transcribe import transcribe_audio
+from app.tenant import (
+    current_tenant_id,
+    get_current_tenant,
+    resolve_tenant,
+    set_current_tenant,
+)
 from app.whatsapp import (
-    NON_TEXT_REPLY,
+    MEDIA_HANDOFF_REPLY,
+    detect_audio_message,
     detect_non_text_message,
+    detect_phone_number_id,
+    download_media,
     parse_incoming,
     send_message,
 )
@@ -72,6 +106,52 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger("malu")
+
+# Fechamento pro cliente quando a coleta termina (o briefing detalhado vai só
+# pra Lu). Inclui o convite pro Instagram e pro grupo VIP de promoções — muitos
+# clientes fecham vendo as promos do grupo. (Para multi-tenant, virar config
+# por agência.)
+COLETA_CONCLUIDA_REPLY = (
+    "Recebi tudo! Já vou organizar pra Lu preparar sua cotação com calma. ✈️\n\n"
+    "Enquanto isso, segue a gente e entra no nosso grupo de promoções — é onde "
+    "saem as melhores oportunidades, sem spam:\n\n"
+    "Instagram: https://instagram.com/lumilhaseviagens\n"
+    "Grupo VIP: https://chat.whatsapp.com/KkWYCAtn3z46bg8W0rK4oc\n\n"
+    "Logo a Lu te chama por aqui. 🙂"
+)
+
+# Mensagem ÚNICA quando a IA cai (primária + reserva). A Malu avisa o cliente
+# uma vez, sinaliza que a Lu assume e silencia (não repete o erro a cada turno).
+IA_FALHA_REPLY = (
+    "Opa, tive um probleminha técnico aqui agora 😅\n\n"
+    "Já avisei a Lu e ela vai continuar seu atendimento pessoalmente por aqui, "
+    "tá? Já já ela te responde. 💛"
+)
+
+# Mensagem quando a coleta trava num impasse (Malu repetindo a mesma pergunta
+# sem o cliente avançar — §6). A Lu assume em vez de a Malu insistir.
+IMPASSE_REPLY = (
+    "Acho melhor a Lu seguir com você a partir daqui pra não te fazer repetir, "
+    "tá? Já vou chamá-la aqui. 💛"
+)
+
+# Anti-loop (Alavanca D): duas falas da Malu com semelhança >= este limiar (texto
+# normalizado, difflib) contam como "mesma pergunta repetida". Mensagens curtas
+# (< _LOOP_MIN_LEN) não contam — saudação/confirmação curta não é loop.
+_LOOP_SIMILARITY_THRESHOLD = 0.85
+_LOOP_MIN_LEN = 40
+
+# Fixação em SUB-pergunta (refino 3, 05/07): o modelo escapa do _too_similar
+# repetindo a MESMA pergunta com o resto do texto diferente (o "qual aeroporto
+# GRU/CGH/VCP?" 3× do cenário S4 da conformidade). Pergunta normalizada menor
+# que _QUESTION_MIN_LEN é cortesia ("tudo bem?"), não coleta; trecho contíguo
+# idêntico >= _QUESTION_MIN_OVERLAP entre duas perguntas marca a mesma pergunta
+# re-embutida numa frase composta diferente. 25 (era 30): no caso real de 05/07
+# o modelo parafraseou a MESMA pergunta mantendo só "…a primeira quinzena de
+# agosto" (29 chars contíguos, pontuação diferente ao redor) e escapou do
+# limiar — a 5ª repetição de "qual dia exato" passou batida ao vivo.
+_QUESTION_MIN_LEN = 15
+_QUESTION_MIN_OVERLAP = 25
 
 
 @asynccontextmanager
@@ -111,6 +191,10 @@ app.add_middleware(
 
 # Rotas REST do CRM (todas em /api/*, exigem X-API-Key)
 app.include_router(api_router)
+
+# Endpoint do cron (/internal/tick) — dispara follow-ups + resumo diário.
+# Protegido por X-Cron-Secret (CRON_SECRET), fora do /api do painel.
+app.include_router(tick_api.router)
 
 
 # ---------------------------------------------------------------------------
@@ -206,9 +290,32 @@ async def handle_message(data: dict[str, Any]) -> None:
            manda pergunta de intent (1/2), marca awaiting_intent, sai.
         6. Caminho normal: histórico → IA → resposta → briefing.
     """
-    # 0) Mensagem de tipo não-texto (áudio, imagem, vídeo, etc.)
-    #    Responde educadamente em vez de ficar muda. Não chama IA, não
-    #    persiste no histórico Redis (cliente vai reescrever em texto).
+    # -1) Resolve a agência (tenant) pelo número de destino e guarda no contexto
+    #     da request. Desconhecido → tenant default (a Lu) — o número único de
+    #     hoje segue funcionando. Os módulos de saída/consulta leem isso no B4/B5;
+    #     aqui só resolve e arma o contexto (comportamento inalterado).
+    tenant = await resolve_tenant(detect_phone_number_id(data))
+    set_current_tenant(tenant)
+    if tenant is not None:
+        logger.debug("tenant resolvido: %s", tenant.nome)
+
+    # 0) Áudio (nota de voz / arquivo) → transcreve e segue como texto (quando
+    #    ligado); desligado ou em erro, cai no handoff de mídia (acolhe + Lu).
+    audio = detect_audio_message(data)
+    if audio is not None:
+        a_phone, a_profile, a_media_id = audio
+        logger.info("audio message from %s (profile=%r)", a_phone, a_profile)
+        # Já transferida? Malu fica em silêncio (Lu cuida) — só audita.
+        if await get_state(a_phone) == STATE_TRANSFERRED:
+            asyncio.create_task(
+                _persist_conversation(a_phone, "[áudio]", "", "transferred")
+            )
+            return
+        await _handle_audio_message(a_phone, a_profile, a_media_id)
+        return
+
+    # 0b) Outras mídias (imagem/vídeo/documento) → handoff pra Lu (como hoje).
+    #     A Malu NÃO lê/extrai — acolhe e passa pra Lu.
     non_text = detect_non_text_message(data)
     if non_text is not None:
         nt_phone, nt_profile, nt_type = non_text
@@ -216,26 +323,145 @@ async def handle_message(data: dict[str, Any]) -> None:
             "non-text message type=%s from %s (profile=%r)",
             nt_type, nt_phone, nt_profile,
         )
-        try:
-            await send_message(nt_phone, NON_TEXT_REPLY)
-        except Exception:
-            logger.exception("send NON_TEXT_REPLY failed for %s", nt_phone)
-        asyncio.create_task(
-            _persist_conversation(
-                nt_phone, f"[mensagem de {nt_type}]", NON_TEXT_REPLY, f"non-text:{nt_type}"
+        # Já transferida? Malu fica em silêncio (Lu cuida) — só audita.
+        if await get_state(nt_phone) == STATE_TRANSFERRED:
+            asyncio.create_task(
+                _persist_conversation(nt_phone, f"[mídia: {nt_type}]", "", "transferred")
             )
-        )
+            return
+        await _handle_media_message(nt_phone, nt_profile, nt_type)
         return
 
     parsed = parse_incoming(data)
     if parsed is None:
         return
     phone, user_text, profile_name = parsed
+    await _process_text_message(phone, user_text, profile_name)
 
+
+def _split_and_clean(reply: str) -> tuple[str, str | None, bool, bool]:
+    """Pós-produção padrão de uma resposta do modelo antes de ir pro cliente.
+
+    Separa o bloco de briefing (fim de coleta) e o marcador `## TRANSFERIR`
+    (sinais INTERNOS — não vão pro cliente), aplica o guard de preço e o
+    sanitizer de formatação. Retorna
+    (texto_pro_cliente, briefing_block, wants_transfer, price_blocked).
+    """
+    customer_reply, briefing_block = split_reply_and_briefing(reply)
+    customer_reply, wants_transfer = split_reply_and_transfer(customer_reply)
+    customer_reply, price_blocked = price_guard(customer_reply)
+    customer_reply = sanitize_outgoing(customer_reply)
+    return customer_reply, briefing_block, wants_transfer, price_blocked
+
+
+def _last_assistant(history: list[dict[str, Any]]) -> str | None:
+    """Última fala da Malu no histórico (ou None se ainda não houver)."""
+    for msg in reversed(history):
+        if msg.get("role") == "assistant":
+            return str(msg.get("content") or "")
+    return None
+
+
+def _normalize_for_compare(text: str) -> str:
+    """Minúsculas + espaços colapsados — pra comparar duas falas por semelhança."""
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _too_similar(a: str, b: str) -> bool:
+    """True se `a` e `b` são quase a mesma mensagem (pergunta repetida = loop).
+
+    Mensagens curtas (< `_LOOP_MIN_LEN`) não contam — evita falso-positivo com
+    saudações/confirmações curtas. Compara texto normalizado via difflib.
+    """
+    if not a or not b:
+        return False
+    na, nb = _normalize_for_compare(a), _normalize_for_compare(b)
+    if len(na) < _LOOP_MIN_LEN or len(nb) < _LOOP_MIN_LEN:
+        return False
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= _LOOP_SIMILARITY_THRESHOLD
+
+
+def _last_assistants(history: list[dict[str, Any]], n: int) -> list[str]:
+    """Últimas `n` falas da Malu, da mais recente pra mais antiga."""
+    out: list[str] = []
+    for msg in reversed(history):
+        if msg.get("role") == "assistant":
+            out.append(str(msg.get("content") or ""))
+            if len(out) == n:
+                break
+    return out
+
+
+def _questions_of(text: str) -> list[str]:
+    """Perguntas contidas numa fala (frases terminadas em "?"), normalizadas.
+
+    Perguntas curtas demais ficam de fora — cortesia não é coleta."""
+    out: list[str] = []
+    for part in re.split(r"\n+|(?<=[.!?])\s+", text or ""):
+        part = re.sub(r"[*_~\s]+$", "", part.strip())
+        if not part.endswith("?"):
+            continue
+        q = _normalize_for_compare(re.sub(r"[*_~]", "", part))
+        if len(q) >= _QUESTION_MIN_LEN:
+            out.append(q)
+    return out
+
+
+def _same_question(q: str, others: list[str]) -> bool:
+    """`q` re-faz alguma pergunta de `others`: quase igual no todo OU com um
+    trecho contíguo idêntico longo (a mesma pergunta embutida noutra frase)."""
+    for other in others:
+        sm = difflib.SequenceMatcher(None, q, other)
+        if sm.ratio() >= _LOOP_SIMILARITY_THRESHOLD:
+            return True
+        match = sm.find_longest_match(0, len(q), 0, len(other))
+        if match.size >= _QUESTION_MIN_OVERLAP:
+            return True
+    return False
+
+
+def _question_fixation(reply: str, history: list[dict[str, Any]]) -> bool:
+    """True se `reply` re-faz uma MESMA pergunta presente nas DUAS últimas falas
+    da Malu — 3ª ocorrência = fixação real (refino 3, 05/07).
+
+    O `_too_similar` compara a fala INTEIRA e é cego quando o modelo repete a
+    sub-pergunta com o resto diferente. Exigir a 3ª ocorrência separa fixação
+    de follow-up legítimo: re-perguntar a metade não respondida de uma pergunta
+    composta é normal UMA vez; na terceira é loop.
+    """
+    prevs = _last_assistants(history, n=2)
+    if len(prevs) < 2:
+        return False
+    qs_prev1, qs_prev2 = _questions_of(prevs[0]), _questions_of(prevs[1])
+    if not qs_prev1 or not qs_prev2:
+        return False
+    return any(
+        _same_question(q, qs_prev1) and _same_question(q, qs_prev2)
+        for q in _questions_of(reply)
+    )
+
+
+async def _process_text_message(
+    phone: str,
+    user_text: str,
+    profile_name: str | None,
+    from_audio: bool = False,
+    media_path: str | None = None,
+) -> None:
+    """Processa uma mensagem de TEXTO (ou um áudio já transcrito).
+
+    Mesmo fluxo de decisão de `handle_message` a partir do passo 1 (/sair →
+    transferido → cliente → intent → IA → briefing). `from_audio=True` quando o
+    texto veio de um áudio transcrito: pede pra Malu confirmar de leve o que
+    entendeu (a transcrição pode ter erros) e pula o debounce (o áudio já é uma
+    fala completa). `media_path` = caminho do áudio no Storage (pra Lu ouvir no
+    painel), gravado na mensagem do cliente.
+    """
     logger.info(
-        "incoming from %s (profile=%r): %s",
+        "incoming from %s (profile=%r)%s: %s",
         phone,
         profile_name,
+        " [áudio]" if from_audio else "",
         user_text[:120],
     )
 
@@ -244,6 +470,7 @@ async def handle_message(data: dict[str, Any]) -> None:
         logger.info("exit command from %s — closing session", phone)
         await clear_history(phone)
         await clear_state(phone)
+        await clear_coleta_state(phone)
         await cancel_reminders(phone)
         try:
             await send_message(phone, EXIT_REPLY)
@@ -339,38 +566,555 @@ async def handle_message(data: dict[str, Any]) -> None:
             return
 
     # 6) Fluxo normal — IA + briefing
-    history.append({"role": "user", "content": user_text})
-    customer_context = {"name": customer_name, "is_first_turn": is_first_turn}
-    reply, model_used = await route_and_ask(history, customer_context=customer_context)
-    history.append({"role": "assistant", "content": reply})
+    # Debounce (Fase 1C): se o cliente está mandando mensagens picadas em
+    # rajada, espera juntá-las e responde uma vez só — evita estourar o limite
+    # do Groq e a Malu ficar repetitiva. Quem não é o último da rajada desiste.
+    # Áudio pula o debounce: a transcrição já é uma fala completa.
+    if not from_audio:
+        burst = await collect_burst(phone, user_text)
+        if burst is None:
+            return
+        user_text = "\n".join(burst)
+        history = await get_history(phone)  # relê após a espera (estado mais fresco)
 
+    history.append({"role": "user", "content": user_text})
+
+    # Alavanca B: extrai o estado da coleta 1× e injeta no prompt pra a Malu NÃO
+    # reperguntar o que já foi dito (mata o loop de campo já respondido). Pulado
+    # no 1º turno (nada coletado) e quando desligado (COLETA_STATE_ENABLED — custa
+    # 1 extração por turno). Reusado no gate de finalização (mesma history), então
+    # não há extração dobrada nos turnos que fecham a coleta.
+    lead_data_cache: dict[str, Any] | None = None
+    ficha_fresca = False  # a extração DESTE turno funcionou (não é ficha antiga)
+    coleta_state: str | None = None
+    if not is_first_turn and settings.coleta_state_enabled:
+        raw_state = None
+        try:
+            raw_state = await extract_lead_data(history)
+        except Exception:
+            logger.exception("coleta_state: extração falhou para %s", phone)
+        if raw_state:
+            # Merge com a ficha acumulada: a extração re-lê tudo a cada turno e
+            # oscila (campo capturado some no turno seguinte) — acumular garante
+            # que dado dito 1× não se perde e o gate não repergunta.
+            lead_data_cache = merge_ficha(
+                await get_coleta_state(phone), normalize_lead_data(raw_state)
+            )
+            ficha_fresca = True
+            await save_coleta_state(phone, lead_data_cache)
+        else:
+            # Resiliência (05/07): extração morta (pico/cota — Groq 429 e cadeia
+            # fallback instável, visto ao vivo) deixava digest, nudge e gate sem
+            # NADA — a Malu voava às cegas e reperguntava tudo. A última ficha
+            # BOA persistida degrada isso pra "estado de 1-2 turnos atrás", que
+            # ainda preserva o anti-repergunta e o tipo de atendimento.
+            lead_data_cache = await get_coleta_state(phone)
+            if lead_data_cache is not None:
+                logger.warning(
+                    "coleta_state: extração fora p/ %s — usando ficha persistida",
+                    phone,
+                )
+        if lead_data_cache is not None:
+            coleta_state = build_coleta_digest(lead_data_cache, history)
+
+    customer_context = {
+        "name": customer_name,
+        "is_first_turn": is_first_turn,
+        "from_audio": from_audio,
+        "coleta_state": coleta_state,
+    }
+    reply, model_used = await route_and_ask(history, customer_context=customer_context)
+
+    # As DUAS IAs falharam (primária + reserva). Em vez de repetir o erro a cada
+    # mensagem (parecendo quebrada), a Malu avisa UMA vez, silencia e chama a Lu.
+    if model_used == "error":
+        await _handle_ai_failure(phone, user_text, customer_name)
+        return
+
+    # Pós-produção: separa "## Resumo" (fim de coleta) e "## TRANSFERIR" (sinais
+    # INTERNOS que não vão pro cliente), aplica guard de preço e sanitiza.
+    customer_reply, briefing_block, wants_transfer, price_blocked = _split_and_clean(reply)
+
+    # Fecho DETERMINÍSTICO (refino 05/07): a coleta está completa pelo gate
+    # (reusa a extração da Alavanca B) mas o modelo não emitiu o "## Resumo"
+    # nem pediu transferência → o código fecha. O "FECHE AGORA" do digest é
+    # instrução, e o modelo fallback demonstradamente a ignora (S3 da suíte de
+    # conformidade: com tudo coletado, seguia oferecendo menus de opcionais em
+    # loop). O bloco do modelo é só GATILHO — o briefing da Lu nasce de
+    # render_briefing(data) —, então dá pra fechar sem a cooperação dele; a
+    # resposta ao cliente vira o fechamento padrão (_build_closing_reply).
+    # Só fecha com ficha DESTE turno (ficha_fresca): a persistida pode estar 1
+    # turno atrás da última fala do cliente — fechar por ela arriscaria ignorar
+    # uma correção recém-dita. (O fecho via "## Resumo" do modelo segue valendo.)
+    if (
+        not briefing_block
+        and not wants_transfer
+        and ficha_fresca
+        and lead_data_cache is not None
+        and not gate_missing_fields(lead_data_cache, history)
+    ):
+        logger.info(
+            "fecho determinístico p/ %s: gate completo sem Resumo do modelo", phone
+        )
+        briefing_block = render_briefing(lead_data_cache, phone)
+
+    # Anti-loop (Alavanca D): se a resposta ficou quase IGUAL à última fala da
+    # Malu (o cliente não respondeu aquele ponto e ela ia repetir), re-prompta
+    # UMA vez pedindo pra avançar (campo opcional → "sem preferência"). Se ainda
+    # assim repetir, é impasse (§6) → a Lu assume. Só no caminho de coleta normal
+    # (transferência e fim-de-coleta seguem direto).
+    if not wants_transfer and not briefing_block:
+        previous = _last_assistant(history)
+        if previous is not None and (
+            _too_similar(customer_reply, previous)
+            or _question_fixation(customer_reply, history)
+        ):
+            logger.info("anti-loop: resposta repetida para %s — re-prompt", phone)
+            reply2, model2 = await route_and_ask(
+                history, customer_context={**customer_context, "anti_loop": True}
+            )
+            if model2 != "error":
+                cr2, bb2, wt2, pb2 = _split_and_clean(reply2)
+                if bb2 or wt2 or not (
+                    _too_similar(cr2, previous) or _question_fixation(cr2, history)
+                ):
+                    customer_reply, briefing_block, wants_transfer, price_blocked = (
+                        cr2, bb2, wt2, pb2,
+                    )
+                    model_used = model2
+                else:
+                    # Refino 2 (05/07): a repetição persistiu mesmo no re-prompt.
+                    # Antes de chamar a Lu, tenta destravar por CÓDIGO: pede só o
+                    # mínimo crítico que falta (a fixação costuma ser em campo
+                    # OPCIONAL — o "qual aeroporto?" do S4 derrubava na Lu um
+                    # cliente cooperativo com a coleta essencial andando).
+                    # Impasse de verdade fica pra quando não sabemos o que falta
+                    # (extração fora) ou quando até o nudge repetiria a fala
+                    # anterior (já foi tentado e não avançou).
+                    nudge: str | None = None
+                    if lead_data_cache is not None:
+                        falta = gate_missing_fields(lead_data_cache, history)
+                        if falta:
+                            nudge = ask_missing_fields(falta, lead_data_cache)
+                    if nudge is not None and not _too_similar(nudge, previous):
+                        logger.info(
+                            "anti-loop: repetição persistente p/ %s — nudge "
+                            "determinístico no lugar do impasse",
+                            phone,
+                        )
+                        customer_reply = nudge
+                        briefing_block = None
+                        wants_transfer = False
+                    else:
+                        logger.info(
+                            "anti-loop: impasse persistente para %s — Lu assume", phone
+                        )
+                        await _impasse_to_lu(phone, user_text, customer_name)
+                        return
+
+    if price_blocked:
+        logger.warning(
+            "price_guard bloqueou valor na resposta ao cliente %s (modelo=%s)",
+            phone,
+            model_used,
+        )
+        # Refino 5 (05/07): o guard SUBSTITUI a resposta inteira pela frase
+        # defensiva — sem pergunta nenhuma, a conversa morre (no S3 o 1º contato
+        # do cliente recebeu SÓ a frase: nem saudação, nem próximo passo).
+        # Recoloca a coleta nos trilhos anexando o pedido do mínimo crítico que
+        # falta (reusa a extração da Alavanca B; no 1º turno extrai agora — o
+        # custo extra só existe neste caminho raro). O 💛 da frase defensiva sai
+        # pra não duplicar com o do nudge (regra de 1 emoji por mensagem).
+        if not briefing_block and not wants_transfer and "?" not in customer_reply:
+            data = lead_data_cache
+            if data is None:
+                try:
+                    raw = await extract_lead_data(history)
+                    data = normalize_lead_data(raw) if raw else None
+                except Exception:
+                    logger.exception("extração pós-price_guard falhou p/ %s", phone)
+                    data = None
+            falta = gate_missing_fields(data, history) if data is not None else []
+            if falta:
+                base = customer_reply.replace("💛", "").rstrip()
+                customer_reply = f"{base}\n\n{ask_missing_fields(falta, data)}"
+
+    if wants_transfer:
+        await _transfer_to_lu(phone, user_text, customer_reply, customer_name)
+        return
+
+    # Coleta concluída (modelo emitiu "## Resumo") → ANTES de fechar, passa pelo
+    # GATE de completude: não fecha lead com data vaga, sem passageiros ou sem
+    # ter perguntado a indicação (mínimo crítico). Extrai/normaliza 1× e reusa.
+    if briefing_block:
+        # Reusa a extração da Alavanca B quando é DESTE turno; senão extrai
+        # agora. Se a cadeia de IA estiver esgotada (429 em todo provedor —
+        # visto ao vivo em 05/07 18:42), o PRÓPRIO bloco que o modelo emitiu
+        # vira fonte via parse determinístico, por cima da ficha persistida —
+        # o gate valida do mesmo jeito (data vaga/passada segue barrada). Sem
+        # isso o gate rodava sobre {} e pedia TUDO de novo.
+        if lead_data_cache is not None and ficha_fresca:
+            lead_data = lead_data_cache
+        else:
+            raw = None
+            try:
+                raw = await extract_lead_data(history)
+            except Exception:
+                logger.exception("extração no fecho falhou p/ %s", phone)
+            base = merge_ficha(
+                lead_data_cache, normalize_lead_data(parse_briefing_block(briefing_block))
+            )
+            if raw:
+                lead_data = merge_ficha(base, normalize_lead_data(raw))
+            else:
+                lead_data = base or None
+            if lead_data and settings.coleta_state_enabled:
+                await save_coleta_state(phone, lead_data)
+        # GATE de completude — fail-CLOSED: se a extração (2ª chamada de IA) caiu
+        # (None ou {}), NÃO liberar o fecho. Roda o gate sobre {} → devolve o
+        # mínimo crítico a confirmar. Antes era fail-OPEN (else []): um pico que
+        # derrubasse só a extração (chat OK, mas JSON-mode falhou) deixava passar
+        # lead furado — justo o que o gate existe pra barrar. A extração re-tenta
+        # no próximo turno; no pior caso a Malu pede 1 dado de novo (recuperável).
+        missing = gate_missing_fields(
+            lead_data if lead_data is not None else {}, history
+        )
+        if missing:
+            # Coleta furada (ou não-validável) → NÃO finaliza; pede o que falta e
+            # segue coletando. (briefing_block=None reaproveita o caminho normal:
+            # salva histórico, agenda lembrete, e o gate re-checa no próximo turno.)
+            nudge = ask_missing_fields(missing, lead_data)
+            previous = _last_assistant(history)
+            if previous is not None and _too_similar(nudge, previous):
+                # O MESMO nudge já foi a última fala e o cliente respondeu —
+                # sem extração viva não há como validar a resposta; repetir
+                # verbatim é o loop real de 05/07 18:42/18:43 (o nudge do gate
+                # não passa pelo anti-loop do modelo). Impasse (§6): a Lu
+                # assume com o histórico completo.
+                logger.info(
+                    "gate re-barrou com o mesmo nudge p/ %s — Lu assume", phone
+                )
+                await _impasse_to_lu(phone, user_text, customer_name)
+                return
+            logger.info("gate barrou finalização p/ %s — faltam: %s", phone, missing)
+            customer_reply = nudge
+            briefing_block = None
+        else:
+            numero = await _finalize_lead(phone, history, briefing_block, lead_data)
+            # Push web pra Lu (Fase 3) — fire-and-forget, não atrasa a resposta
+            # nem quebra o fluxo se o push estiver desligado/falhar.
+            titulo = f"Novo lead #{numero}" if numero is not None else "Novo lead"
+            asyncio.create_task(
+                send_push_to_all(
+                    titulo,
+                    f"{customer_name or 'Cliente'} — toque pra abrir a conversa",
+                    url=f"/conversas/{phone}",
+                )
+            )
+            # Fechamento controlado SEMPRE — CTA (Instagram + grupo VIP) em toda
+            # finalização de cotação, não só quando o modelo não escreve nada.
+            customer_reply = _build_closing_reply(numero, lead_data)
+
+            # Coleta concluída → Malu se CALA e o lead fica aguardando a Lu cotar.
+            # Sem isso, cada "ok/obrigado" do cliente faz o modelo re-emitir o
+            # briefing → lead + protocolo DUPLICADOS a cada mensagem (bug grave).
+            # A ficha morre junto — não vaza pra uma próxima cotação na mesma
+            # janela de sessão.
+            await set_state(phone, STATE_TRANSFERRED)
+            await cancel_reminders(phone)
+            await clear_coleta_state(phone)
+
+    history.append({"role": "assistant", "content": customer_reply})
     await save_history(phone, history)
 
-    send_task = asyncio.create_task(send_message(phone, reply))
-    audit_task = asyncio.create_task(_persist_conversation(phone, user_text, reply, model_used))
-
-    briefing = extract_briefing(reply)
-    if briefing:
-        temp = parse_lead_temp(briefing)
-        try:
-            async with SessionLocal() as db:
-                await save_lead(phone, briefing, temp, db)
-                briefing_name = extract_customer_name(briefing)
-                if briefing_name:
-                    await update_preferred_name(phone, briefing_name, db)
-                await db.commit()
-        except Exception:
-            logger.exception("save_lead failed for %s", phone)
-        try:
-            await notify_luciana(briefing, phone)
-        except Exception:
-            logger.exception("notify_luciana failed for %s", phone)
+    # Marca no registro que a entrada veio de áudio transcrito (Lu vê no painel
+    # que foi nota de voz — útil se a transcrição tiver errado algo).
+    incoming_label = f"🎤 {user_text}" if from_audio else user_text
+    send_task = asyncio.create_task(send_message(phone, customer_reply))
+    audit_task = asyncio.create_task(
+        _persist_conversation(
+            phone, incoming_label, customer_reply, model_used, user_media_path=media_path
+        )
+    )
 
     await asyncio.gather(send_task, audit_task, return_exceptions=True)
 
-    # Reagenda lembretes de inatividade a partir do momento atual.
-    # cancel + reschedule é idempotente (vide app/reminders.py).
-    await schedule_reminders(phone)
+    # Lembrete de inatividade: só enquanto a coleta está em aberto. Se o
+    # briefing já foi finalizado (cotação completa), não cutuca — limpa
+    # qualquer lembrete pendente. cancel/schedule são idempotentes.
+    if briefing_block:
+        await cancel_reminders(phone)
+    else:
+        # t0 = agora (≈ esta mensagem do cliente); agenda 30 min + pré-24h.
+        await schedule_callbacks(phone, name=customer_name)
+
+
+async def _transfer_to_lu(
+    phone: str,
+    user_text: str,
+    customer_reply: str,
+    customer_name: str | None,
+) -> None:
+    """Transfere a conversa pra Lu (cliente quer falar de algo que ela já fez).
+
+    Marca STATE_TRANSFERRED (Malu cala), avisa a Lu e para os lembretes.
+    Identifica o cliente pelo telefone — nunca pede código de cotação.
+    """
+    reply_text = customer_reply or transferred_reply(customer_name)
+    await set_state(phone, STATE_TRANSFERRED)
+    await cancel_reminders(phone)
+    send_task = asyncio.create_task(send_message(phone, reply_text))
+    audit_task = asyncio.create_task(
+        _persist_conversation(phone, user_text, reply_text, "flow:transfer-marker")
+    )
+    try:
+        await notify_luciana_returning_client(phone, customer_name)
+    except Exception:
+        logger.exception("notify_luciana_returning_client failed for %s", phone)
+    await asyncio.gather(send_task, audit_task, return_exceptions=True)
+
+
+async def _impasse_to_lu(
+    phone: str,
+    user_text: str,
+    customer_name: str | None,
+) -> None:
+    """Impasse (§6): a Malu ficou repetindo a mesma pergunta sem o cliente
+    avançar → em vez de insistir, a Lu assume.
+
+    Marca STATE_TRANSFERRED (Malu cala), avisa a Lu com o contexto certo
+    (travou/loop, não "cliente pediu") e para os lembretes.
+    """
+    await set_state(phone, STATE_TRANSFERRED)
+    await cancel_reminders(phone)
+    send_task = asyncio.create_task(send_message(phone, IMPASSE_REPLY))
+    audit_task = asyncio.create_task(
+        _persist_conversation(phone, user_text, IMPASSE_REPLY, "flow:impasse")
+    )
+    try:
+        await notify_luciana_impasse(phone, customer_name)
+    except Exception:
+        logger.exception("notify_luciana_impasse failed for %s", phone)
+    await asyncio.gather(send_task, audit_task, return_exceptions=True)
+
+
+async def _handle_ai_failure(
+    phone: str,
+    user_text: str,
+    customer_name: str | None,
+) -> None:
+    """As duas IAs caíram — anti-repetição + chama a Lu.
+
+    Manda UMA mensagem pro cliente, marca STATE_TRANSFERRED (Malu silencia nas
+    próximas — nada de repetir o erro), para os lembretes e avisa a Lu pra
+    assumir no painel. Quando a Lu "devolver", a Malu volta ao normal.
+    """
+    logger.warning("IA indisponível (primária+reserva) para %s — chamando a Lu", phone)
+    await set_state(phone, STATE_TRANSFERRED)
+    await cancel_reminders(phone)
+    send_task = asyncio.create_task(send_message(phone, IA_FALHA_REPLY))
+    audit_task = asyncio.create_task(
+        _persist_conversation(phone, user_text, IA_FALHA_REPLY, "flow:ai-failure")
+    )
+    try:
+        await notify_luciana_ai_down(phone, customer_name)
+    except Exception:
+        logger.exception("notify_luciana_ai_down failed for %s", phone)
+    await asyncio.gather(send_task, audit_task, return_exceptions=True)
+
+
+async def _handle_audio_message(
+    phone: str,
+    profile_name: str | None,
+    media_id: str,
+) -> None:
+    """Cliente mandou áudio — transcreve e segue a conversa como texto.
+
+    Se a transcrição estiver desligada, ou falhar (download/Whisper/áudio
+    vazio), cai no handoff de mídia de hoje (acolhe + passa pra Lu) — o cliente
+    nunca fica sem resposta. Sucesso → entra no fluxo de texto com `from_audio`
+    (a Malu confirma de leve o que entendeu).
+    """
+    if not settings.audio_transcription_enabled:
+        await _handle_media_message(phone, profile_name, "audio")
+        return
+
+    transcript: str | None = None
+    media_path: str | None = None
+    try:
+        audio_bytes, mime_type = await download_media(media_id)
+        # Guarda o áudio pra Lu ouvir no painel (best-effort: se o Storage não
+        # estiver configurado ou falhar, volta None e a transcrição segue).
+        # Recodifica pra MP3 antes (conserta a duração quebrada do OGG do
+        # WhatsApp, que faz o player parar cedo). Se o ffmpeg falhar, sobe o OGG.
+        mp3 = await transcode_to_mp3(audio_bytes)
+        if mp3:
+            media_path = await upload_audio(phone, mp3, "audio/mpeg")
+        else:
+            media_path = await upload_audio(phone, audio_bytes, mime_type)
+        # Transcrição usa o ÁUDIO ORIGINAL (o Whisper lê OGG sem problema).
+        transcript = await transcribe_audio(audio_bytes, mime_type)
+    except Exception:
+        logger.exception("transcrição de áudio falhou para %s", phone)
+
+    if not transcript or not transcript.strip():
+        logger.info("áudio de %s sem transcrição utilizável — handoff pra Lu", phone)
+        await _handle_media_message(phone, profile_name, "audio", media_path=media_path)
+        return
+
+    await _process_text_message(
+        phone, transcript.strip(), profile_name, from_audio=True, media_path=media_path
+    )
+
+
+async def _handle_media_message(
+    phone: str,
+    profile_name: str | None,
+    media_type: str,
+    media_path: str | None = None,
+) -> None:
+    """Cliente mandou mídia/documento — a Malu não lê: acolhe e passa pra Lu.
+
+    Marca STATE_TRANSFERRED (Malu cala), para os callbacks, avisa a Lu e
+    nunca tenta transcrever/extrair o conteúdo.
+    """
+    customer_name = profile_name
+    try:
+        async with SessionLocal() as db:
+            cliente = await get_or_create_cliente(phone, profile_name, db)
+            await db.commit()
+            customer_name = cliente.display_name
+    except Exception:
+        logger.exception("get_or_create_cliente (media) failed for %s", phone)
+
+    await set_state(phone, STATE_TRANSFERRED)
+    await cancel_reminders(phone)
+    send_task = asyncio.create_task(send_message(phone, MEDIA_HANDOFF_REPLY))
+    audit_task = asyncio.create_task(
+        _persist_conversation(
+            phone,
+            f"[mídia: {media_type}]",
+            MEDIA_HANDOFF_REPLY,
+            f"media:{media_type}",
+            user_media_path=media_path,
+        )
+    )
+    try:
+        await notify_luciana_media(phone, customer_name, media_type)
+    except Exception:
+        logger.exception("notify_luciana_media failed for %s", phone)
+    await asyncio.gather(send_task, audit_task, return_exceptions=True)
+
+
+def _build_closing_reply(
+    numero: int | None, data: dict[str, Any] | None = None
+) -> str:
+    """Mensagem de fechamento ao cliente em toda finalização de cotação.
+
+    O CTA (Instagram + grupo VIP) vai SEMPRE — antes só ia quando o modelo não
+    escrevia nada junto do briefing. Mensagem controlada e única por cotação
+    (boa pra qualidade Meta). Anexa o protocolo (#1001...) quando houver e, com
+    `data`, um recap do que foi anotado — o cliente vê que a Malu capturou tudo
+    (e um erro de captura aparece AGORA, não quando a Lu cotar errado).
+    """
+    # Marca por agência (B4): usa os links do tenant atual quando houver; sem
+    # tenant/brand (testes, cron) cai no texto padrão da Lu — comportamento
+    # idêntico. (TODO multi-tenant: as menções textuais a "Lu" no corpo também
+    # viram brand antes de onboardar a 1ª agência externa.)
+    tenant = get_current_tenant()
+    brand = tenant.brand if tenant is not None else {}
+    instagram = brand.get("instagram")
+    grupo = brand.get("grupo_vip")
+    if instagram or grupo:
+        reply = (
+            "Recebi tudo! Já vou organizar pra Lu preparar sua cotação com calma. ✈️\n\n"
+            "Enquanto isso, segue a gente e entra no nosso grupo de promoções — é onde "
+            "saem as melhores oportunidades, sem spam:\n\n"
+            f"Instagram: {instagram or 'https://instagram.com/lumilhaseviagens'}\n"
+            f"Grupo VIP: {grupo or 'https://chat.whatsapp.com/KkWYCAtn3z46bg8W0rK4oc'}\n\n"
+            "Logo a Lu te chama por aqui. 🙂"
+        )
+    else:
+        reply = COLETA_CONCLUIDA_REPLY
+    recap = build_recap(data) if data else None
+    if recap:
+        # Os dois textos-base começam com "Recebi tudo!" — o recap entra ali.
+        reply = reply.replace("Recebi tudo!", f"Recebi tudo! Anotei: {recap}.", 1)
+    if numero is not None:
+        reply = reply.rstrip() + f"\n\n🔖 *Protocolo da sua solicitação:* #{numero}"
+    return reply
+
+
+async def _finalize_lead(
+    phone: str,
+    history: list[dict[str, Any]],
+    briefing_block: str,
+    data: dict[str, Any] | None,
+) -> int | None:
+    """Fecha a coleta: salva o lead (extração já validada pelo gate) e notifica.
+
+    `data` = extração ESTRUTURADA já normalizada (vinda do dispatch, que passou
+    pelo gate de completude). Se for None, a IA caiu na extração → cai pro parser
+    regex sobre o bloco que a Malu escreveu, rede de segurança pra nunca perder
+    um lead.
+
+    Retorna o número de protocolo do lead (#1001...) pra entrar no fechamento,
+    ou None se o save falhar.
+    """
+    if data:
+        briefing_md = render_briefing(data, phone)
+        cols = lead_columns_from_data(data)
+        numero: int | None = None
+        try:
+            async with SessionLocal() as db:
+                lead = await save_lead(
+                    phone,
+                    db,
+                    briefing_md=briefing_md,
+                    lead_temp=cols["lead_temp"],
+                    name=cols["name"],
+                    destination=cols["destination"],
+                    travel_type=cols["travel_type"],
+                    indicado_por=cols["indicado_por"],
+                    raw_data=data,
+                )
+                numero = lead.numero
+                if cols["name"]:
+                    await update_preferred_name(phone, cols["name"], db)
+                await db.commit()
+        except Exception:
+            logger.exception("save_lead (estruturado) failed for %s", phone)
+        try:
+            await notify_luciana(briefing_md, phone, numero=numero)
+        except Exception:
+            logger.exception("notify_luciana failed for %s", phone)
+        return numero
+
+    # Fallback: extração falhou (IA fora) → usa o bloco da Malu via regex
+    logger.warning("extração estruturada falhou p/ %s — usando fallback regex", phone)
+    temp = parse_lead_temp(briefing_block)
+    name = extract_customer_name(briefing_block)
+    numero = None
+    try:
+        async with SessionLocal() as db:
+            lead = await save_lead(
+                phone,
+                db,
+                briefing_md=briefing_block,
+                lead_temp=temp,
+                name=name,
+            )
+            numero = lead.numero
+            if name:
+                await update_preferred_name(phone, name, db)
+            await db.commit()
+    except Exception:
+        logger.exception("save_lead (fallback) failed for %s", phone)
+    try:
+        await notify_luciana(briefing_block, phone, numero=numero)
+    except Exception:
+        logger.exception("notify_luciana (fallback) failed for %s", phone)
+    return numero
 
 
 async def _persist_conversation(
@@ -378,18 +1122,38 @@ async def _persist_conversation(
     user_text: str,
     reply: str,
     model_used: str,
+    user_media_path: str | None = None,
 ) -> None:
-    """Grava as duas mensagens (user + assistant) na tabela conversations."""
+    """Grava as duas mensagens (user + assistant) na tabela conversations.
+
+    Timestamps DISTINTOS (Malu 10ms depois do cliente) garantem a ordem no
+    painel — senão as duas empatam no mesmo instante e a thread embaralha
+    (resposta da Malu aparecendo antes da pergunta do cliente).
+
+    `user_media_path` = caminho do áudio do cliente no Storage (só quando a
+    mensagem veio de uma nota de voz), gravado na linha do cliente.
+    """
     try:
         async with SessionLocal() as db:
+            now = datetime.now(timezone.utc)
+            tid = current_tenant_id()  # carimbo do tenant (B5); None → NULL
             db.add_all(
                 [
-                    Conversation(phone=phone, role="user", content=user_text),
+                    Conversation(
+                        phone=phone,
+                        role="user",
+                        content=user_text,
+                        media_path=user_media_path,
+                        created_at=now,
+                        tenant_id=tid,
+                    ),
                     Conversation(
                         phone=phone,
                         role="assistant",
                         content=reply,
                         model_used=model_used,
+                        created_at=now + timedelta(milliseconds=10),
+                        tenant_id=tid,
                     ),
                 ]
             )

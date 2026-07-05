@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, or_, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import require_api_key
 from app.api.schemas import (
     ClienteOut,
     LeadDetail,
+    LeadIn,
     LeadListItem,
     LeadListResponse,
     LeadOut,
 )
 from app.database import get_session
 from app.models import Cliente, Conversation, Lead
+from app.tenant import current_tenant_id, tenant_filter
 
 router = APIRouter(
     prefix="/leads",
@@ -28,14 +30,15 @@ router = APIRouter(
 async def list_leads(
     temp: str | None = Query(default=None, description="Filtro: frio|morno|quente|urgente"),
     q: str | None = Query(default=None, description="Busca: nome ou telefone"),
+    sort: str = Query(default="recent", description="Ordenação: recent (mais novo) | oldest (mais antigo)"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     db: AsyncSession = Depends(get_session),
 ) -> LeadListResponse:
-    """Lista paginada de leads, com filtro opcional de temperatura e busca."""
-    base = select(Lead)
+    """Lista paginada de leads, com filtro de temperatura, busca e ordenação."""
+    base = select(Lead).where(tenant_filter(Lead))
 
-    if temp:
+    if temp and temp.lower() != "all":
         base = base.where(Lead.lead_temp == temp.lower())
 
     if q:
@@ -46,10 +49,13 @@ async def list_leads(
     total_stmt = select(func.count()).select_from(base.subquery())
     total = (await db.execute(total_stmt)).scalar_one()
 
+    # Ordenação por data (default: mais novo primeiro)
+    order = Lead.created_at.asc() if sort == "oldest" else Lead.created_at.desc()
+
     # Paginação
     offset = (page - 1) * page_size
     rows = await db.execute(
-        base.order_by(Lead.created_at.desc()).limit(page_size).offset(offset)
+        base.order_by(order).limit(page_size).offset(offset)
     )
     items = [LeadListItem.model_validate(lead) for lead in rows.scalars().all()]
 
@@ -61,21 +67,16 @@ async def list_leads(
     )
 
 
-@router.get("/{phone}", response_model=LeadDetail)
-async def get_lead_by_phone(
-    phone: str,
-    db: AsyncSession = Depends(get_session),
-) -> LeadDetail:
-    """Detalhe de um lead pelo phone (chave natural)."""
-    lead_row = await db.execute(select(Lead).where(Lead.phone == phone))
-    lead = lead_row.scalar_one_or_none()
-    if lead is None:
-        raise HTTPException(status_code=404, detail="lead não encontrado")
-
-    cliente_row = await db.execute(select(Cliente).where(Cliente.phone == phone))
+async def _build_lead_detail(lead: Lead, db: AsyncSession) -> LeadDetail:
+    """Monta o LeadDetail (lead + cliente + contagem de mensagens)."""
+    cliente_row = await db.execute(
+        select(Cliente).where(Cliente.phone == lead.phone, tenant_filter(Cliente))
+    )
     cliente = cliente_row.scalar_one_or_none()
 
-    count_stmt = select(func.count(Conversation.id)).where(Conversation.phone == phone)
+    count_stmt = select(func.count(Conversation.id)).where(
+        Conversation.phone == lead.phone, tenant_filter(Conversation)
+    )
     count = (await db.execute(count_stmt)).scalar_one()
 
     return LeadDetail(
@@ -83,3 +84,75 @@ async def get_lead_by_phone(
         cliente=ClienteOut.model_validate(cliente) if cliente else None,
         conversation_count=int(count or 0),
     )
+
+
+@router.get("/by-numero/{numero}", response_model=LeadDetail)
+async def get_lead_by_numero(
+    numero: int,
+    db: AsyncSession = Depends(get_session),
+) -> LeadDetail:
+    """Detalhe de UMA cotação específica pelo seu número (#1001...)."""
+    lead_row = await db.execute(
+        select(Lead).where(Lead.numero == numero, tenant_filter(Lead))
+    )
+    lead = lead_row.scalar_one_or_none()
+    if lead is None:
+        raise HTTPException(status_code=404, detail="cotação não encontrada")
+    return await _build_lead_detail(lead, db)
+
+
+@router.get("/{phone}", response_model=LeadDetail)
+async def get_lead_by_phone(
+    phone: str,
+    db: AsyncSession = Depends(get_session),
+) -> LeadDetail:
+    """Detalhe da cotação MAIS RECENTE de um telefone.
+
+    Como o mesmo cliente pode ter várias cotações, devolve a última (usada no
+    painel lateral da conversa). Pra uma cotação específica, use /by-numero.
+    """
+    lead_row = await db.execute(
+        select(Lead)
+        .where(Lead.phone == phone, tenant_filter(Lead))
+        .order_by(Lead.created_at.desc())
+        .limit(1)
+    )
+    lead = lead_row.scalar_one_or_none()
+    if lead is None:
+        raise HTTPException(status_code=404, detail="lead não encontrado")
+    return await _build_lead_detail(lead, db)
+
+
+@router.post("", response_model=LeadOut, status_code=201)
+async def create_lead(
+    body: LeadIn,
+    db: AsyncSession = Depends(get_session),
+) -> Lead:
+    """Cria um lead/cotação manualmente pelo painel (numero gerado pela sequência)."""
+    lead = Lead(
+        phone=body.phone.strip(),
+        name=(body.name or None),
+        destination=(body.destination or None),
+        travel_type=(body.travel_type or None),
+        lead_temp=(body.lead_temp or None),
+        tenant_id=current_tenant_id(),  # carimbo do tenant (B7a)
+    )
+    db.add(lead)
+    await db.commit()
+    await db.refresh(lead)
+    return lead
+
+
+@router.delete("/by-numero/{numero}", status_code=204)
+async def delete_lead(
+    numero: int,
+    db: AsyncSession = Depends(get_session),
+) -> Response:
+    """Exclui uma cotação pelo número. NÃO apaga conversas nem o cliente."""
+    result = await db.execute(
+        delete(Lead).where(Lead.numero == numero, tenant_filter(Lead))
+    )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="cotação não encontrada")
+    await db.commit()
+    return Response(status_code=204)

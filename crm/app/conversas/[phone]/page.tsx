@@ -1,0 +1,75 @@
+import Link from "next/link";
+import { ArrowLeft } from "lucide-react";
+
+import {
+  getConversation,
+  getConversationState,
+  getLead,
+  listConversations,
+  listTags,
+} from "@/lib/api";
+import { ConversaWorkspace } from "@/components/conversas/conversa-workspace";
+import { ConversationList } from "@/components/conversas/conversation-list";
+import { AutoRefresh } from "@/components/auto-refresh";
+
+export const dynamic = "force-dynamic";
+
+export default async function ConversaDetailPage({
+  params,
+}: {
+  params: Promise<{ phone: string }>;
+}) {
+  const { phone } = await params;
+  const decoded = decodeURIComponent(phone);
+
+  const [conv, state, conversas, lead, allTags] = await Promise.all([
+    getConversation(decoded),
+    getConversationState(decoded),
+    listConversations({}),
+    getLead(decoded),
+    listTags(),
+  ]);
+
+  const currentTags =
+    conversas.find((c) => c.phone === decoded)?.tags ?? [];
+
+  return (
+    <div className="space-y-3">
+      {/* Thread se atualiza sozinha (poll leve ~4s no conversa-view); aqui o
+          refresh lento só mantém a sidebar/lead frescas sem pesar. */}
+      <AutoRefresh intervalMs={30000} />
+
+      <Link
+        href="/conversas"
+        className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground md:hidden"
+      >
+        <ArrowLeft className="size-4" /> Conversas
+      </Link>
+
+      <div className="flex h-[calc(100dvh-9rem)] min-h-[480px] overflow-hidden rounded-xl border border-border bg-card shadow-sm">
+        {/* Painel 1 — lista */}
+        <aside className="hidden w-[280px] shrink-0 flex-col overflow-y-auto border-r border-border md:flex">
+          <div className="border-b border-border px-4 py-3">
+            <p className="text-sm font-semibold">Conversas</p>
+          </div>
+          <ConversationList conversations={conversas} activePhone={decoded} />
+        </aside>
+
+        {/* Painéis 2 e 3 — thread + lead (com toggle) */}
+        {conv === null ? (
+          <div className="grid min-w-0 flex-1 place-items-center p-10 text-center text-sm text-muted-foreground">
+            Conversa não encontrada.
+          </div>
+        ) : (
+          <ConversaWorkspace
+            conv={conv}
+            initialPaused={state.bot_paused}
+            lead={lead}
+            allTags={allTags}
+            currentTags={currentTags}
+          />
+        )}
+      </div>
+    </div>
+  );
+}

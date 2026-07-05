@@ -20,12 +20,18 @@ const TEMPS = [
   { value: "frio", label: "Frio" },
 ];
 
+const SORTS = [
+  { value: "recent", label: "Mais novos" },
+  { value: "oldest", label: "Mais antigos" },
+];
+
 export function LeadsFilters() {
   const router = useRouter();
   const params = useSearchParams();
   const [, startTransition] = useTransition();
   const [q, setQ] = useState(params.get("q") ?? "");
   const temp = params.get("temp") ?? "all";
+  const sort = params.get("sort") ?? "recent";
 
   useEffect(() => {
     const h = setTimeout(() => {
@@ -52,10 +58,22 @@ export function LeadsFilters() {
     );
   }
 
+  function changeSort(value: string | null) {
+    const next = new URLSearchParams(params.toString());
+    if (!value || value === "recent") next.delete("sort");
+    else next.set("sort", value);
+    next.delete("page_size");
+    startTransition(() =>
+      router.replace(`/leads${next.toString() ? `?${next}` : ""}`, {
+        scroll: false,
+      }),
+    );
+  }
+
   return (
     <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
       <div className="relative flex-1">
-        <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-zinc-400" />
+        <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
         <Input
           placeholder="Buscar por nome ou telefone"
           aria-label="Buscar leads por nome ou telefone"
@@ -76,6 +94,21 @@ export function LeadsFilters() {
           {TEMPS.map((t) => (
             <SelectItem key={t.value} value={t.value}>
               {t.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <Select value={sort} onValueChange={changeSort}>
+        <SelectTrigger
+          aria-label="Ordenar leads por data"
+          className="h-11 sm:w-44"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {SORTS.map((s) => (
+            <SelectItem key={s.value} value={s.value}>
+              {s.label}
             </SelectItem>
           ))}
         </SelectContent>

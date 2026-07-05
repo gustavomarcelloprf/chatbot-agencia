@@ -5,8 +5,9 @@ from __future__ import annotations
 import pytest
 
 from app.whatsapp import (
+    MEDIA_HANDOFF_REPLY,
     NON_TEXT_MESSAGE_TYPES,
-    NON_TEXT_REPLY,
+    detect_audio_message,
     detect_non_text_message,
     parse_incoming,
 )
@@ -130,13 +131,51 @@ def test_parse_incoming_returns_none_for_non_text() -> None:
 
 
 # ---------------------------------------------------------------------------
-# NON_TEXT_REPLY — qualidade
+# detect_audio_message — devolve o media_id pra baixar o áudio
 # ---------------------------------------------------------------------------
-def test_non_text_reply_is_warm_and_useful() -> None:
-    assert NON_TEXT_REPLY
-    assert len(NON_TEXT_REPLY) > 50
-    # Menciona texto explicitamente — orienta o cliente
-    assert "texto" in NON_TEXT_REPLY.lower()
-    # Não promete suporte futuro ("em breve", "estou aprendendo") — evita expectativa errada
-    assert "em breve" not in NON_TEXT_REPLY.lower()
-    assert "aprendendo" not in NON_TEXT_REPLY.lower()
+def test_detects_audio_and_returns_media_id() -> None:
+    result = detect_audio_message(_make_payload("audio"))
+    assert result is not None
+    phone, profile_name, media_id = result
+    assert phone == "5511999998888"
+    assert profile_name == "Cliente Teste"
+    assert media_id == "media_id_123"
+
+
+def test_detect_audio_without_profile() -> None:
+    result = detect_audio_message(_make_payload("audio", with_profile=False))
+    assert result is not None
+    phone, profile_name, media_id = result
+    assert phone == "5511999998888"
+    assert profile_name is None
+    assert media_id == "media_id_123"
+
+
+def test_detect_audio_ignores_text_and_image() -> None:
+    assert detect_audio_message(_make_payload("text")) is None
+    assert detect_audio_message(_make_payload("image")) is None
+
+
+def test_detect_audio_returns_none_without_id() -> None:
+    """Áudio sem id de mídia não dá pra baixar — não detecta."""
+    payload = _make_payload("audio")
+    payload["entry"][0]["changes"][0]["value"]["messages"][0]["audio"] = {}
+    assert detect_audio_message(payload) is None
+
+
+def test_detect_audio_empty_payload() -> None:
+    assert detect_audio_message({}) is None
+    assert detect_audio_message({"entry": []}) is None
+
+
+# ---------------------------------------------------------------------------
+# MEDIA_HANDOFF_REPLY — qualidade
+# ---------------------------------------------------------------------------
+def test_media_handoff_reply_hands_to_lu_without_promising_to_read() -> None:
+    assert MEDIA_HANDOFF_REPLY
+    assert len(MEDIA_HANDOFF_REPLY) > 50
+    # Passa pra Lu (handoff)
+    assert "lu" in MEDIA_HANDOFF_REPLY.lower()
+    # Nunca promete ler/transcrever a mídia, nem suporte futuro
+    assert "transcre" not in MEDIA_HANDOFF_REPLY.lower()
+    assert "em breve" not in MEDIA_HANDOFF_REPLY.lower()

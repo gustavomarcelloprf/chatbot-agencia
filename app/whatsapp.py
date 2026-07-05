@@ -11,19 +11,62 @@ from typing import Any
 import httpx
 
 from app.config import settings
+from app.tenant import get_current_tenant
 
 logger = logging.getLogger(__name__)
 
 GRAPH_API_VERSION = "v21.0"
+# O envio de áudio (nota de voz) usa a flag `voice: true`, que só existe em
+# versões mais novas da Graph. Isolado aqui pra NÃO mexer no caminho de texto
+# (v21.0, estável). Cloud API é retrocompatível.
+AUDIO_GRAPH_API_VERSION = "v23.0"
+
+
+def _tenant_creds() -> tuple[str, str]:
+    """`(wa_phone_id, wa_token)` do tenant atual, com fallback seguro pros globals.
+
+    Lê a agência do contexto da request (B3). Sem tenant (ex.: caminho do painel,
+    cron, testes) → credenciais globais do `.env` (= a Lu hoje). Se o token do
+    tenant não decifrar (chave errada), degrada pro global e loga — um erro de
+    chave NUNCA derruba o envio.
+    """
+    tenant = get_current_tenant()
+    if tenant is not None:
+        try:
+            from app.crypto import decrypt
+
+            return tenant.wa_phone_id, decrypt(tenant.wa_token_enc)
+        except Exception:
+            logger.warning(
+                "wa_token do tenant %s indecifrável — usando credencial global",
+                getattr(tenant, "nome", "?"),
+            )
+    return settings.wa_phone_id, settings.wa_token
+
+
+def _phone_id() -> str:
+    return _tenant_creds()[0]
+
+
+def _token() -> str:
+    return _tenant_creds()[1]
 
 
 def _api_url() -> str:
-    return f"https://graph.facebook.com/{GRAPH_API_VERSION}/{settings.wa_phone_id}/messages"
+    return f"https://graph.facebook.com/{GRAPH_API_VERSION}/{_phone_id()}/messages"
+
+
+def _audio_messages_url() -> str:
+    return f"https://graph.facebook.com/{AUDIO_GRAPH_API_VERSION}/{_phone_id()}/messages"
+
+
+def _media_upload_url() -> str:
+    return f"https://graph.facebook.com/{AUDIO_GRAPH_API_VERSION}/{_phone_id()}/media"
 
 
 def _headers() -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {settings.wa_token}",
+        "Authorization": f"Bearer {_token()}",
         "Content-Type": "application/json",
     }
 
@@ -81,6 +124,81 @@ async def send_message(to: str, text: str) -> bool:
         return False
 
 
+async def upload_media(
+    audio_bytes: bytes,
+    mime_type: str = "audio/ogg",
+    filename: str = "nota.ogg",
+) -> str | None:
+    """Sobe mídia pra Graph API (passo 1 do envio) e devolve o `media_id`.
+
+    Multipart: `file` (binário) + `messaging_product=whatsapp` + `type` (MIME).
+    Retorna `None` em falha (logada) — o chamador decide o que fazer.
+    """
+    if not audio_bytes:
+        return None
+
+    auth = {"Authorization": f"Bearer {_token()}"}
+    data = {"messaging_product": "whatsapp", "type": mime_type}
+    files = {"file": (filename, audio_bytes, mime_type)}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                _media_upload_url(), headers=auth, data=data, files=files
+            )
+        if resp.status_code >= 400:
+            logger.error(
+                "whatsapp upload_media failed status=%s body=%s",
+                resp.status_code,
+                resp.text,
+            )
+            return None
+        return (resp.json() or {}).get("id")
+    except httpx.HTTPError:
+        logger.exception("whatsapp upload_media HTTP error")
+        return None
+
+
+async def send_audio(to: str, media_id: str, voice: bool = True) -> bool:
+    """Envia áudio pelo Cloud API (passo 2). `voice=True` → nota de voz (OGG/Opus).
+
+    NÃO faz retry interno: se falhar (ex.: a Meta recusa `voice:true`), devolve
+    False e o CHAMADOR decide o fallback. Isso importa porque OGG/Opus como anexo
+    comum (voice=false) NÃO toca no iPhone — o fallback certo é mandar o MP3, não
+    reenviar o mesmo OGG sem a flag.
+    """
+    audio: dict[str, Any] = {"id": media_id}
+    if voice:
+        audio["voice"] = True
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "audio",
+        "audio": audio,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                _audio_messages_url(), headers=_headers(), json=payload
+            )
+        if resp.status_code >= 400:
+            logger.warning(
+                "whatsapp send_audio falhou status=%s voice=%s body=%s",
+                resp.status_code,
+                voice,
+                resp.text[:300],
+            )
+            return False
+        logger.info(
+            "whatsapp send_audio OK to=%s media_id=%s voice=%s", to, media_id, voice
+        )
+        return True
+    except httpx.HTTPError:
+        logger.exception("whatsapp send_audio HTTP error for %s", to)
+        return False
+
+
 async def send_template(to: str, template: str, params: list[str]) -> bool:
     """Envia mensagem usando um template pré-aprovado.
 
@@ -121,6 +239,11 @@ async def send_template(to: str, template: str, params: list[str]) -> bool:
         return False
 
 
+# Tipos de áudio (nota de voz e arquivo de áudio). Tratados ANTES do handoff
+# genérico: se a transcrição estiver ligada, a Malu transcreve e segue a
+# conversa; senão (ou em erro), cai no handoff de mídia abaixo.
+AUDIO_MESSAGE_TYPES: frozenset[str] = frozenset({"audio", "voice"})
+
 # Tipos de mensagem WhatsApp que NÃO são texto — a Malu não consome ainda,
 # mas reconhece e responde educadamente em vez de ficar muda.
 # Lista oficial: https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks/payload-examples
@@ -137,11 +260,12 @@ NON_TEXT_MESSAGE_TYPES: frozenset[str] = frozenset(
     }
 )
 
-# Resposta padrão quando o cliente manda algo que não é texto.
-# Mantém o tom acolhedor da Malu sem prometer suporte futuro.
-NON_TEXT_REPLY: str = (
-    "Oi! Por enquanto eu só consigo entender mensagens de texto. 😊\n\n"
-    "Pode escrever o que você precisa? Assim a Lu consegue te atender com mais rapidez."
+# Resposta quando o cliente manda mídia/documento: a Malu não lê — acolhe e
+# passa pra Lu (sem prometer transcrição/leitura). Tom acolhedor, ≤1 emoji.
+MEDIA_HANDOFF_REPLY: str = (
+    "Oi! Recebi seu arquivo aqui 🙌\n\n"
+    "Pra cuidar disso com a atenção que merece, já estou chamando a Lu — "
+    "ela continua seu atendimento por aqui. Já já ela te responde!"
 )
 
 
@@ -159,6 +283,21 @@ def _extract_phone_and_profile(
         if isinstance(raw, str) and raw.strip():
             profile_name = raw.strip()
     return phone, profile_name
+
+
+def detect_phone_number_id(data: dict[str, Any]) -> str | None:
+    """Extrai o `phone_number_id` (número de DESTINO da Meta) do webhook.
+
+    É a chave de roteamento multi-tenant: identifica PARA QUAL número/agência a
+    mensagem veio (`value.metadata.phone_number_id`). `None` se o payload não
+    trouxer (ex.: status update sem metadata, ou formato inesperado).
+    """
+    try:
+        value = data["entry"][0]["changes"][0]["value"]
+        pid = value.get("metadata", {}).get("phone_number_id")
+        return str(pid) if pid else None
+    except (KeyError, IndexError, AttributeError, TypeError):
+        return None
 
 
 def parse_incoming(
@@ -235,3 +374,64 @@ def detect_non_text_message(
     except (KeyError, IndexError, AttributeError, TypeError):
         logger.exception("detect_non_text_message failed")
         return None
+
+
+def detect_audio_message(
+    data: dict[str, Any],
+) -> tuple[str, str | None, str] | None:
+    """Detecta mensagem de áudio/voz e devolve `(phone, profile_name, media_id)`.
+
+    O `media_id` é o id da mídia na Graph API — usado por `download_media()`
+    pra baixar os bytes do áudio. Retorna `None` se não for áudio, payload
+    inválido, ou se faltar telefone/id.
+    """
+    try:
+        entry = data.get("entry", [])
+        if not entry:
+            return None
+        changes = entry[0].get("changes", [])
+        if not changes:
+            return None
+        value = changes[0].get("value", {})
+        messages = value.get("messages", [])
+        if not messages:
+            return None
+
+        msg = messages[0]
+        msg_type = msg.get("type")
+        if msg_type not in AUDIO_MESSAGE_TYPES:
+            return None
+
+        media = msg.get(msg_type) or {}
+        media_id = media.get("id")
+        phone, profile_name = _extract_phone_and_profile(value, msg)
+        if not phone or not media_id:
+            return None
+        return phone, profile_name, media_id
+    except (KeyError, IndexError, AttributeError, TypeError):
+        logger.exception("detect_audio_message failed")
+        return None
+
+
+async def download_media(media_id: str) -> tuple[bytes, str]:
+    """Baixa os bytes de uma mídia do WhatsApp (2 passos da Graph API).
+
+    1) `GET /{media_id}` → metadados (URL temporária + `mime_type`)
+    2) `GET <url>` → bytes binários (precisa do MESMO Bearer token)
+
+    Retorna `(bytes, mime_type)`. Lança em erro de rede/HTTP ou se a mídia
+    não tiver URL de download.
+    """
+    meta_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{media_id}"
+    auth = {"Authorization": f"Bearer {_token()}"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        meta_resp = await client.get(meta_url, headers=auth)
+        meta_resp.raise_for_status()
+        meta = meta_resp.json()
+        media_url = meta.get("url")
+        mime_type = meta.get("mime_type") or "audio/ogg"
+        if not media_url:
+            raise RuntimeError(f"mídia {media_id} sem URL de download")
+        bin_resp = await client.get(media_url, headers=auth)
+        bin_resp.raise_for_status()
+        return bin_resp.content, mime_type

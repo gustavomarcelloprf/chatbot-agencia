@@ -1,6 +1,24 @@
 export type LeadTemp = "frio" | "morno" | "quente" | "urgente";
 
+export interface Tag {
+  id: string;
+  name: string;
+  color: string;
+  created_at: string;
+}
+
 export type HealthStatus = "ok" | "degraded" | "down";
+
+export interface AppConfig {
+  luciana_phone: string;
+  ai_primary: string;
+  ai_fallback: string;
+  business_hours_start: number;
+  business_hours_end: number;
+  app_env: string;
+  version: string;
+  vapid_public_key?: string;
+}
 
 export interface ClienteOut {
   phone: string;
@@ -11,18 +29,22 @@ export interface ClienteOut {
 
 export interface LeadOut {
   id: string;
+  numero: number | null;
   phone: string;
   name: string | null;
   destination: string | null;
   travel_type: string | null;
+  indicado_por: string | null;
   lead_temp: LeadTemp | null;
   briefing_md: string | null;
+  raw_data: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
 
 export interface LeadListItem {
   id: string;
+  numero: number | null;
   phone: string;
   name: string | null;
   destination: string | null;
@@ -49,6 +71,7 @@ export interface MessageOut {
   role: "user" | "assistant";
   content: string;
   model_used: string | null;
+  audio_url: string | null;
   created_at: string;
 }
 
@@ -56,6 +79,28 @@ export interface ConversationDetail {
   phone: string;
   customer_name: string | null;
   messages: MessageOut[];
+}
+
+export interface ConversationSummary {
+  phone: string;
+  customer_name: string | null;
+  last_message_at: string;
+  last_message_preview: string;
+  message_count: number;
+  lead_temp: LeadTemp | null;
+  bot_paused: boolean;
+  tags: Tag[];
+}
+
+export interface ConversationState {
+  phone: string;
+  bot_paused: boolean;
+}
+
+export interface ReplyResult {
+  phone: string;
+  sent: boolean;
+  error: string | null;
 }
 
 export interface DashboardMetrics {

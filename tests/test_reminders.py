@@ -1,217 +1,319 @@
-"""Testes dos lembretes de inatividade (Sprint 2).
+"""Testes do agendamento de callbacks (Postgres) e do disparo via cron.
 
-Mockamos o Celery — não disparamos jobs reais, só checamos contratos:
-    - schedule_reminders chama apply_async 3x com countdowns corretos
-    - schedule_reminders chama cancel_reminders antes (idempotência)
-    - cancel_reminders revoga cada task_id e apaga a key no Redis
-    - send_reminder pula se state == TRANSFERRED
-    - send_reminder pula se get_history retorna vazio
+A camada de banco é mockada (a máquina não roda Postgres local) — checamos
+contratos: schedule grava 30 min + pré-24h e apaga pendentes antes (supersede);
+cancel apaga pendentes; run_due dispara os vencidos respeitando as travas
+(Lu assumiu / sessão expirou). A lógica de HORÁRIO do pré-24h vive em
+test_callbacks.py (função pura).
 """
 
 from __future__ import annotations
 
-import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from app import reminders
+from app.callbacks import CALLBACK_30M, CALLBACK_PRE24H, render_callback
+from app.models import Reminder
 from app.reminders import (
-    REMINDER_15M,
-    REMINDER_5H,
-    REMINDER_23H,
+    KIND_30M,
+    KIND_PRE24H,
+    REMINDER_30M,
+    THIRTY_MIN_SECONDS,
+    _build_due_rows,
+    _dispatch_one,
     cancel_reminders,
-    schedule_reminders,
+    run_due_reminders,
+    schedule_callbacks,
 )
-from app.session import STATE_TRANSFERRED, get_redis, set_state
-from workers import tasks as workers_tasks
+from app.session import STATE_TRANSFERRED, save_history, set_state
 
 
 # ---------------------------------------------------------------------------
-# schedule_reminders
+# Fake session — async context manager que grava add()/execute()
+# ---------------------------------------------------------------------------
+class _FakeResult:
+    def __init__(self, rows):  # noqa: ANN001
+        self._rows = rows
+
+    def scalars(self):  # noqa: ANN201
+        return self
+
+    def all(self):  # noqa: ANN201
+        return self._rows
+
+
+class _FakeSession:
+    def __init__(self, select_rows=None):  # noqa: ANN001
+        self.added: list = []
+        self.executed: list = []
+        self._rows = select_rows or []
+        self.committed = False
+
+    async def __aenter__(self):  # noqa: ANN204
+        return self
+
+    async def __aexit__(self, *a):  # noqa: ANN002, ANN204
+        return False
+
+    async def execute(self, stmt):  # noqa: ANN001, ANN201
+        self.executed.append(stmt)
+        return _FakeResult(self._rows)
+
+    def add(self, obj):  # noqa: ANN001
+        self.added.append(obj)
+
+    async def commit(self):  # noqa: ANN201
+        self.committed = True
+
+
+# ---------------------------------------------------------------------------
+# _build_due_rows (PURO)
+# ---------------------------------------------------------------------------
+def test_build_due_rows_always_has_30min() -> None:
+    """O de 30 min sai SEMPRE (due = now + 1800s), mesmo sem pré-24h válido."""
+    tz = ZoneInfo("America/Sao_Paulo")
+    now = datetime(2026, 6, 23, 14, 0, tzinfo=tz)
+    with patch.object(reminders, "_compute_pre24h_target", return_value=None):
+        rows = _build_due_rows(now, now, "Ana", tz)
+
+    assert len(rows) == 1
+    kind, due_at, message = rows[0]
+    assert kind == KIND_30M
+    assert due_at == now + timedelta(seconds=THIRTY_MIN_SECONDS)
+    assert message == render_callback(CALLBACK_30M, "Ana")
+
+
+def test_build_due_rows_includes_pre24h_when_valid() -> None:
+    """Havendo horário válido, sai também o pré-24h com aquele due_at."""
+    tz = ZoneInfo("America/Sao_Paulo")
+    now = datetime(2026, 6, 23, 14, 0, tzinfo=tz)
+    alvo = datetime(2026, 6, 24, 13, 0, tzinfo=tz)
+    with patch.object(reminders, "_compute_pre24h_target", return_value=alvo):
+        rows = _build_due_rows(now, now, None, tz)
+
+    assert len(rows) == 2
+    assert rows[1] == (KIND_PRE24H, alvo, render_callback(CALLBACK_PRE24H, None))
+
+
+# ---------------------------------------------------------------------------
+# schedule_callbacks / cancel_reminders (banco mockado)
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_schedule_reminders_calls_apply_async_with_correct_countdowns() -> None:
-    """Os 3 lembretes devem ser agendados com countdowns 900s, 18000s, 82800s."""
-    chamadas: list[dict] = []
-
-    def fake_apply_async(args, countdown):  # noqa: ANN001
-        chamadas.append({"args": args, "countdown": countdown})
-        # Mimic Celery AsyncResult
-        return SimpleNamespace(id=f"task-{countdown}")
-
-    with patch.object(
-        workers_tasks.send_reminder, "apply_async", side_effect=fake_apply_async
+async def test_schedule_callbacks_deletes_then_inserts() -> None:
+    """Apaga pendentes (supersede) e insere os lembretes; commita."""
+    fake = _FakeSession()
+    with patch.object(reminders, "SessionLocal", lambda: fake), patch.object(
+        reminders, "_compute_pre24h_target", return_value=None
     ):
-        await schedule_reminders("5511999999999")
+        await schedule_callbacks("5511999999999", name="Ana")
 
-    assert len(chamadas) == 3
-    assert [c["countdown"] for c in chamadas] == [900, 18000, 82800]
-    assert chamadas[0]["args"] == ["5511999999999", REMINDER_15M]
-    assert chamadas[1]["args"] == ["5511999999999", REMINDER_5H]
-    assert chamadas[2]["args"] == ["5511999999999", REMINDER_23H]
+    assert len(fake.executed) == 1  # o DELETE de supersede
+    assert len(fake.added) == 1  # só o de 30 min (pré-24h = None)
+    inserted = fake.added[0]
+    assert isinstance(inserted, Reminder)
+    assert inserted.phone == "5511999999999"
+    assert inserted.kind == KIND_30M
+    assert inserted.message == render_callback(CALLBACK_30M, "Ana")
+    assert fake.committed is True
 
 
 @pytest.mark.asyncio
-async def test_schedule_reminders_persists_task_ids_to_redis() -> None:
-    """Os 3 task_ids retornados pelo Celery são salvos em malu:reminders:{phone}."""
-
-    def fake_apply_async(args, countdown):  # noqa: ANN001, ARG001
-        return SimpleNamespace(id=f"tid-{countdown}")
-
-    with patch.object(
-        workers_tasks.send_reminder, "apply_async", side_effect=fake_apply_async
+async def test_schedule_callbacks_inserts_both_when_pre24h_valid() -> None:
+    fake = _FakeSession()
+    alvo = datetime(2026, 6, 24, 13, 0, tzinfo=ZoneInfo("America/Sao_Paulo"))
+    with patch.object(reminders, "SessionLocal", lambda: fake), patch.object(
+        reminders, "_compute_pre24h_target", return_value=alvo
     ):
-        await schedule_reminders("5511888888888")
+        await schedule_callbacks("5511888888888")
 
-    client = get_redis()
-    raw = await client.get("malu:reminders:5511888888888")
-    assert raw is not None
-    stored = json.loads(raw)
-    assert stored == ["tid-900", "tid-18000", "tid-82800"]
+    kinds = sorted(r.kind for r in fake.added)
+    assert kinds == [KIND_30M, KIND_PRE24H]
 
 
 @pytest.mark.asyncio
-async def test_schedule_reminders_cancels_before_scheduling() -> None:
-    """Idempotência: chamar schedule_reminders 2x não duplica jobs — a 2ª revoga a 1ª."""
-    revoke_calls: list[str] = []
+async def test_cancel_reminders_deletes_and_commits() -> None:
+    fake = _FakeSession()
+    with patch.object(reminders, "SessionLocal", lambda: fake):
+        await cancel_reminders("5511777777777")
 
-    def fake_apply_async(args, countdown):  # noqa: ANN001, ARG001
-        return SimpleNamespace(id=f"new-{countdown}")
-
-    def fake_revoke(task_id):  # noqa: ANN001
-        revoke_calls.append(task_id)
-
-    with patch.object(
-        workers_tasks.send_reminder, "apply_async", side_effect=fake_apply_async
-    ), patch.object(workers_tasks.celery_app.control, "revoke", side_effect=fake_revoke):
-        # Primeira chamada — não há nada pra revogar
-        await schedule_reminders("5511777777777")
-        assert revoke_calls == []
-        # Segunda chamada — deve revogar os 3 da primeira antes de reagendar
-        await schedule_reminders("5511777777777")
-
-    assert revoke_calls == ["new-900", "new-18000", "new-82800"]
+    assert len(fake.executed) == 1  # o DELETE
+    assert fake.added == []
+    assert fake.committed is True
 
 
 # ---------------------------------------------------------------------------
-# cancel_reminders
+# _dispatch_one — travas (usa fakeredis do conftest)
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_cancel_reminders_revokes_each_task_id_and_deletes_key() -> None:
-    """cancel_reminders chama revoke pra cada id e apaga a key Redis."""
-    phone = "5511666666666"
-    client = get_redis()
-    await client.set(
-        f"malu:reminders:{phone}", json.dumps(["a", "b", "c"])
-    )
-
-    revoke_calls: list[str] = []
-
-    def fake_revoke(task_id):  # noqa: ANN001
-        revoke_calls.append(task_id)
-
-    with patch.object(
-        workers_tasks.celery_app.control, "revoke", side_effect=fake_revoke
-    ):
-        await cancel_reminders(phone)
-
-    assert revoke_calls == ["a", "b", "c"]
-    assert await client.get(f"malu:reminders:{phone}") is None
-
-
-@pytest.mark.asyncio
-async def test_cancel_reminders_noop_when_nothing_scheduled() -> None:
-    """Sem key no Redis, cancel_reminders não chama revoke e não levanta."""
-    revoke_calls: list[str] = []
-
-    def fake_revoke(task_id):  # noqa: ANN001
-        revoke_calls.append(task_id)
-
-    with patch.object(
-        workers_tasks.celery_app.control, "revoke", side_effect=fake_revoke
-    ):
-        await cancel_reminders("5511555555555")
-
-    assert revoke_calls == []
-
-
-# ---------------------------------------------------------------------------
-# send_reminder task — caminhos de skip
-# ---------------------------------------------------------------------------
-@pytest.mark.asyncio
-async def test_send_reminder_skips_when_transferred() -> None:
-    """Se state == TRANSFERRED, send_message NÃO é chamado."""
-    phone = "5511444444444"
-    await set_state(phone, STATE_TRANSFERRED)
-
-    send_calls: list[tuple[str, str]] = []
-
-    async def fake_send(to, text):  # noqa: ANN001
-        send_calls.append((to, text))
-        return True
-
-    with patch.object(workers_tasks, "send_message", side_effect=fake_send):
-        result = await workers_tasks._send_reminder_async(phone, REMINDER_15M)
-
-    assert send_calls == []
-    assert result["skipped"] == "transferred"
-    assert result["sent"] is False
-
-
-@pytest.mark.asyncio
-async def test_send_reminder_skips_when_history_empty() -> None:
-    """Se get_history retorna vazio (sessão expirou), send_message NÃO é chamado."""
-    phone = "5511333333333"
-    # Sem state e sem history — fakeredis está vazio para este número
-
-    send_calls: list[tuple[str, str]] = []
-
-    async def fake_send(to, text):  # noqa: ANN001
-        send_calls.append((to, text))
-        return True
-
-    with patch.object(workers_tasks, "send_message", side_effect=fake_send):
-        result = await workers_tasks._send_reminder_async(phone, REMINDER_5H)
-
-    assert send_calls == []
-    assert result["skipped"] == "no_history"
-    assert result["sent"] is False
-
-
-@pytest.mark.asyncio
-async def test_send_reminder_sends_when_session_alive() -> None:
-    """Caminho feliz: history não-vazio + state != TRANSFERRED → manda."""
+async def test_dispatch_sends_when_session_alive() -> None:
     phone = "5511222222222"
-    # Popula history mas não seta state
-    from app.session import save_history
-
     await save_history(phone, [{"role": "user", "content": "oi"}])
 
-    send_calls: list[tuple[str, str]] = []
+    sent: list[tuple[str, str]] = []
 
     async def fake_send(to, text):  # noqa: ANN001
-        send_calls.append((to, text))
+        sent.append((to, text))
         return True
 
-    with patch.object(workers_tasks, "send_message", side_effect=fake_send):
-        result = await workers_tasks._send_reminder_async(phone, REMINDER_23H)
+    with patch.object(reminders, "send_message", side_effect=fake_send):
+        ok = await _dispatch_one(phone, REMINDER_30M)
 
-    assert send_calls == [(phone, REMINDER_23H)]
-    assert result["sent"] is True
+    assert ok is True
+    assert sent == [(phone, REMINDER_30M)]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_when_transferred() -> None:
+    phone = "5511444444444"
+    await save_history(phone, [{"role": "user", "content": "oi"}])
+    await set_state(phone, STATE_TRANSFERRED)
+
+    sent: list = []
+
+    async def fake_send(to, text):  # noqa: ANN001
+        sent.append((to, text))
+        return True
+
+    with patch.object(reminders, "send_message", side_effect=fake_send):
+        ok = await _dispatch_one(phone, REMINDER_30M)
+
+    assert ok is False
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_when_history_empty() -> None:
+    phone = "5511333333333"  # sem save_history → sessão "expirada"
+
+    sent: list = []
+
+    async def fake_send(to, text):  # noqa: ANN001
+        sent.append((to, text))
+        return True
+
+    with patch.object(reminders, "send_message", side_effect=fake_send):
+        ok = await _dispatch_one(phone, REMINDER_30M)
+
+    assert ok is False
+    assert sent == []
+
+
+# ---------------------------------------------------------------------------
+# run_due_reminders — reivindica (marca sent_at) e dispara
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_run_due_claims_and_dispatches() -> None:
+    p1, p2 = "5511230000001", "5511230000002"
+    await save_history(p1, [{"role": "user", "content": "oi"}])
+    await save_history(p2, [{"role": "user", "content": "oi"}])
+
+    rows = [
+        SimpleNamespace(phone=p1, message="m1", sent_at=None),
+        SimpleNamespace(phone=p2, message="m2", sent_at=None),
+    ]
+    fake = _FakeSession(select_rows=rows)
+
+    sent: list = []
+
+    async def fake_send(to, text):  # noqa: ANN001
+        sent.append((to, text))
+        return True
+
+    now = datetime(2026, 6, 23, 18, 0, tzinfo=timezone.utc)
+    with patch.object(reminders, "SessionLocal", lambda: fake), patch.object(
+        reminders, "send_message", side_effect=fake_send
+    ):
+        result = await run_due_reminders(now=now)
+
+    assert result == {"claimed": 2, "sent": 2}
+    assert sent == [(p1, "m1"), (p2, "m2")]
+    # marcou sent_at ANTES de mandar (anti-duplicado) e commitou
+    assert all(r.sent_at == now for r in rows)
+    assert fake.committed is True
+
+
+@pytest.mark.asyncio
+async def test_run_due_skips_transferred_but_still_claims() -> None:
+    """Vencido de quem a Lu assumiu é reivindicado (marcado) mas NÃO enviado."""
+    phone = "5511230000003"
+    await save_history(phone, [{"role": "user", "content": "oi"}])
+    await set_state(phone, STATE_TRANSFERRED)
+
+    rows = [SimpleNamespace(phone=phone, message="m", sent_at=None)]
+    fake = _FakeSession(select_rows=rows)
+
+    sent: list = []
+
+    async def fake_send(to, text):  # noqa: ANN001
+        sent.append((to, text))
+        return True
+
+    with patch.object(reminders, "SessionLocal", lambda: fake), patch.object(
+        reminders, "send_message", side_effect=fake_send
+    ):
+        result = await run_due_reminders()
+
+    assert result == {"claimed": 1, "sent": 0}
+    assert sent == []
+    assert rows[0].sent_at is not None  # reivindicado → não volta a disparar
+
+
+@pytest.mark.asyncio
+async def test_run_due_arma_tenant_da_linha_no_disparo() -> None:
+    """Cada lembrete dispara com a agência da própria linha armada no contexto
+    (envio sai do número certo — risco #2) e o contexto é resetado no fim."""
+    import uuid as _uuid
+
+    from app import tenant as tmod
+    from app.tenant import TenantContext
+
+    tid = _uuid.uuid4()
+    ctx = TenantContext(
+        id=tid,
+        nome="Agência B",
+        wa_phone_id="999",
+        wa_token_enc="enc",
+        owner_phone="5511000000000",
+        business_hours_start=9,
+        business_hours_end=18,
+        brand={},
+        prompt_overrides={},
+    )
+    rows = [
+        SimpleNamespace(phone="5511230000009", message="m", sent_at=None, tenant_id=tid)
+    ]
+    fake = _FakeSession(select_rows=rows)
+    seen: dict = {}
+
+    async def fake_by_id(x):  # noqa: ANN001
+        return ctx
+
+    async def fake_dispatch(phone, message):  # noqa: ANN001
+        seen["tenant"] = tmod.get_current_tenant()
+        return True
+
+    now = datetime(2026, 6, 23, 18, 0, tzinfo=timezone.utc)
+    with patch.object(reminders, "SessionLocal", lambda: fake), patch.object(
+        reminders, "resolve_tenant_by_id", side_effect=fake_by_id
+    ), patch.object(reminders, "_dispatch_one", side_effect=fake_dispatch):
+        result = await run_due_reminders(now=now)
+
+    assert result == {"claimed": 1, "sent": 1}
+    assert seen["tenant"] is ctx  # armou a agência da linha no disparo
+    assert tmod.get_current_tenant() is None  # resetou depois
 
 
 # ---------------------------------------------------------------------------
 # Constantes — sanity
 # ---------------------------------------------------------------------------
-def test_reminder_messages_are_distinct_and_non_empty() -> None:
-    msgs = {REMINDER_15M, REMINDER_5H, REMINDER_23H}
-    assert len(msgs) == 3
-    for m in msgs:
-        assert m and len(m) > 30
+def test_thirty_min_seconds() -> None:
+    assert THIRTY_MIN_SECONDS == 1800
 
 
-def test_reminder_schedule_countdowns() -> None:
-    countdowns = [c for c, _ in reminders.REMINDER_SCHEDULE]
-    assert countdowns == [900, 18000, 82800]
+def test_reminder_30m_template_non_empty() -> None:
+    assert REMINDER_30M and len(REMINDER_30M) > 20

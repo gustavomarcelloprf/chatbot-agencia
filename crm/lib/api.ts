@@ -1,13 +1,17 @@
 import "server-only";
 
 import type {
+  AppConfig,
   ConversationDetail,
+  ConversationState,
+  ConversationSummary,
   DashboardInsights,
   DashboardMetrics,
   HealthStatus,
   LeadDetail,
   LeadListResponse,
   LeadTemp,
+  Tag,
 } from "./types";
 
 const API_BASE_URL =
@@ -69,6 +73,15 @@ export async function getDashboardInsights(
   }
 }
 
+export async function getConfig(): Promise<AppConfig | null> {
+  try {
+    return await apiFetch<AppConfig>("/config", { revalidate: 60 });
+  } catch (err) {
+    console.error("[api] getConfig", err);
+    return null;
+  }
+}
+
 export async function getHealthStatus(): Promise<HealthStatus> {
   try {
     const url = `${API_BASE_URL}/health`;
@@ -87,6 +100,7 @@ export async function getHealthStatus(): Promise<HealthStatus> {
 export interface ListLeadsParams {
   temp?: LeadTemp;
   q?: string;
+  sort?: "recent" | "oldest";
   page?: number;
   page_size?: number;
 }
@@ -97,6 +111,7 @@ export async function listLeads(
   const qs = new URLSearchParams();
   if (params.temp) qs.set("temp", params.temp);
   if (params.q) qs.set("q", params.q);
+  if (params.sort) qs.set("sort", params.sort);
   if (params.page) qs.set("page", String(params.page));
   if (params.page_size) qs.set("page_size", String(params.page_size));
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
@@ -119,6 +134,21 @@ export async function getLead(phone: string): Promise<LeadDetail | null> {
   }
 }
 
+// Detalhe de UMA cotação específica pelo número (#1001...). O mesmo cliente
+// pode ter várias cotações, então o detalhe é aberto pelo número, não telefone.
+export async function getLeadByNumero(
+  numero: string | number,
+): Promise<LeadDetail | null> {
+  try {
+    return await apiFetch<LeadDetail>(
+      `/leads/by-numero/${encodeURIComponent(String(numero))}`,
+    );
+  } catch (err) {
+    console.error("[api] getLeadByNumero", err);
+    return null;
+  }
+}
+
 export async function getConversation(
   phone: string,
   limit = 100,
@@ -126,9 +156,51 @@ export async function getConversation(
   try {
     return await apiFetch<ConversationDetail>(
       `/conversations/${encodeURIComponent(phone)}?limit=${limit}`,
+      { revalidate: 0 },
     );
   } catch (err) {
     console.error("[api] getConversation", err);
     return null;
+  }
+}
+
+export async function listConversations(
+  params: { q?: string; limit?: number } = {},
+): Promise<ConversationSummary[]> {
+  const { q, limit = 50 } = params;
+  const qs = new URLSearchParams();
+  qs.set("limit", String(limit));
+  if (q) qs.set("q", q);
+  try {
+    return await apiFetch<ConversationSummary[]>(
+      `/conversations?${qs.toString()}`,
+      { revalidate: 5 },
+    );
+  } catch (err) {
+    console.error("[api] listConversations", err);
+    return [];
+  }
+}
+
+export async function listTags(): Promise<Tag[]> {
+  try {
+    return await apiFetch<Tag[]>("/tags", { revalidate: 30 });
+  } catch (err) {
+    console.error("[api] listTags", err);
+    return [];
+  }
+}
+
+export async function getConversationState(
+  phone: string,
+): Promise<ConversationState> {
+  try {
+    return await apiFetch<ConversationState>(
+      `/conversations/${encodeURIComponent(phone)}/state`,
+      { revalidate: 0 },
+    );
+  } catch (err) {
+    console.error("[api] getConversationState", err);
+    return { phone, bot_paused: false };
   }
 }
